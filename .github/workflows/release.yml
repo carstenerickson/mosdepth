@@ -1,0 +1,121 @@
+name: release-static-binary
+
+# Build a STATICALLY linked linux x86_64 mosdepth from the pinned
+# production/v1.0 source and publish it as a downloadable release asset.
+#
+# WHY STATIC (load-bearing): a mosdepth dynamically linked against
+# Ubuntu's libhts.so.1.13+ds trips hts-nim's parseInt and exits 1 with
+# "could not load: libhts.so". Linking htslib (and everything else)
+# statically removes the libhts.so dependency entirely, so the binary
+# runs on any linux box without the libhts version dance. The
+# brentp/musl-hts-nim alpine+musl image links statically via
+# `nsb -d:nsb_static` (dynlibOverrideAll) and is the path brentp himself
+# uses to ship the upstream `mosdepth` release asset.
+#
+# This is a RELEASE workflow, distinct from the existing build.yml which
+# is a dynamically-linked test-CI matrix and is NOT static.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag to publish the static binary under"
+        default: production-v1.0-static
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  # Build FROM the pinned fork source tag (mosdepth 0.3.14 + fork patch),
+  # NOT master. checkout resolves this slash-bearing tag fine.
+  SOURCE_REF: production/v1.0
+  # Fixed, pinnable asset name consumed by ancestry-pipeline's
+  # scripts/install_external_tools.sh.
+  ASSET_NAME: mosdepth-static-linux-x86_64
+  # brentp/musl-hts-nim (alpine 3.x + musl + static libhts.a/libdeflate.a
+  # + the `nsb` hts_nim_static_builder), pinned by digest of :latest
+  # captured 2026-05-29 for reproducibility.
+  BUILDER_IMAGE: brentp/musl-hts-nim@sha256:1910820a6bae05e97397c2f80c2f36cdedcfae6115e942cad3217b4078e38218
+
+jobs:
+  build-static:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout pinned source (production/v1.0)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          submodules: true
+          fetch-depth: 0
+
+      - name: Build static mosdepth (musl-hts-nim, no d4)
+        run: |
+          set -euxo pipefail
+          docker pull "$BUILDER_IMAGE"
+          # nsb runs `nimble install -d` for mosdepth's deps then
+          # `nimble c -d:nsb_static <args> -o:... mosdepth.nim` inside the
+          # image, writing the static binary to /load/mosdepth. We do NOT
+          # pass -d:d4, so d4-nim/libd4binding is never linked: the
+          # `import d4` and every use site are behind `when defined(d4)`,
+          # matching brentp's plain (non-d4) `mosdepth` release asset.
+          docker run --rm -v "$PWD:/load" -w /load "$BUILDER_IMAGE" \
+            /usr/local/bin/nsb -n /load/mosdepth.nimble -s /load/mosdepth.nim \
+            -- -d:release -d:danger
+          test -f mosdepth
+          # nsb runs as root inside the container, so the output file is
+          # root-owned; take ownership before the unprivileged steps touch it.
+          sudo chown "$(id -u):$(id -g)" mosdepth
+          mv mosdepth "$ASSET_NAME"
+          chmod +x "$ASSET_NAME"
+
+      - name: Verify static (no libhts.so) + functional (THE deliverable)
+        run: |
+          set -euo pipefail
+          echo "== file =="
+          file "$ASSET_NAME"
+          echo "== ldd =="
+          # ldd exits non-zero on a fully static binary ("not a dynamic
+          # executable"); capture instead of letting set -e abort.
+          ldd_out="$(ldd "$ASSET_NAME" 2>&1 || true)"
+          echo "$ldd_out"
+          # HARD requirement: no libhts.so. A dynamic libhts is exactly the
+          # bug this fork exists to avoid.
+          if echo "$ldd_out" | grep -qi 'libhts'; then
+            echo "FAIL: binary dynamically links libhts -- reintroduces the libhts.so bug" >&2
+            exit 1
+          fi
+          # Stronger assertion: no shared-object dependencies at all beyond
+          # the loader/vdso/libc family (musl-static should have none).
+          bad="$(echo "$ldd_out" | grep -E '=>' \
+                 | grep -viE 'lib(c|dl|m|pthread|rt)\.so|ld-(musl|linux)|linux-vdso' || true)"
+          if [ -n "$bad" ]; then
+            echo "FAIL: unexpected dynamic dependencies:" >&2
+            echo "$bad" >&2
+            exit 1
+          fi
+          echo "== --version =="
+          ./"$ASSET_NAME" --version
+          echo "== --help (must show --threads) =="
+          ./"$ASSET_NAME" --help 2>&1 | grep -- --threads
+          echo "static verification passed"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.release_tag || 'production-v1.0-static' }}
+        run: |
+          set -euo pipefail
+          # Point the release tag at the production/v1.0 source commit so
+          # the asset is traceable to the exact source it was built from.
+          SRC_SHA="$(git rev-parse HEAD)"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ASSET_NAME" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" "$ASSET_NAME" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$SRC_SHA" \
+              --title "mosdepth 0.3.14 static (production/v1.0)" \
+              --notes "Statically linked linux x86_64 mosdepth built from the production/v1.0 source via brentp/musl-hts-nim (nsb -d:nsb_static, no d4). ldd-verified to carry no libhts.so dependency. Consumed by ancestry-pipeline scripts/install_external_tools.sh (install_mosdepth)."
+          fi
+          echo "Published $ASSET_NAME to release $TAG in $GITHUB_REPOSITORY"
